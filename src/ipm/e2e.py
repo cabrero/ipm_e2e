@@ -42,6 +42,7 @@ import random
 import re
 import subprocess
 import sys
+import textwrap
 import time
 from typing import Any, AnyStr, Callable, Iterable, Iterator, NamedTuple, Optional, Protocol, TypeVar, Union
 
@@ -50,14 +51,18 @@ gi.require_version('Atspi', '2.0')
 from gi.repository import Atspi
 
 __all__ = [
-    'perform_on',
-    'perform_on_each',
-    'find_obj',
-    'find_all_objs',
+    'do',
+    'expect',
+    'expect_all',
+    'expect_any',
+    'expect_first',
+    'expect_one',
+    'objects_in',
+    'run',
+    
     'obj_get_attr',
     'obj_children',
     'tree_walk',
-    'run',
     'is_error',
     'fail_on_error',
     'Either',
@@ -128,7 +133,7 @@ def fail_on_error(x: Either[Any]) -> Any:
 def _pprint(obj: Atspi.Object) -> str:
     role = obj.get_role_name()
     name = obj.get_name() or ""
-    return f"{role} ({name})"
+    return f"{role}('{name}')"
 
 
 def _get_action_idx(obj: Atspi.Object, name: str) -> Optional[int]:
@@ -167,7 +172,7 @@ def obj_get_attr(obj: Atspi.Object, name:str) -> Either[str]:
     if name == 'role':
         return obj.get_role_name()
     elif name == 'name':
-        return getattr(obj, 'name') or ""
+        return obj.get_name() or ""
     elif name == 'text':
         return obj.get_text(0, -1)
     elif hasattr(obj, name):
@@ -296,81 +301,6 @@ def _find_all_descendants(root: Atspi.Object, kwargs: MatchArgs) -> Iterable[Ats
     return descendants
 
     
-def find_obj(root: Atspi.Object, **kwargs: MatchArgs) -> Either[Atspi.Object]:
-    """Searchs for the first at-spi object that matches the arguments.
-
-    This functions searchs the given `root` object and its descendants
-    (inorder), looking for the first object that matches the patterns
-    in `kwargs`.
-
-    When `kwargs` is empty, the `root` object is selected.
-
-    Parameters
-    ----------
-    root : Atspi.Object
-        The object to start the search from
-    **kwargs
-        See :py:data:`MatchArgs`
-
-    Returns
-    -------
-    Atspi.Object
-        The first descendant (inorder) that matches the arguments
-    NotFoundError
-        When no object matches the arguments
-
-    """
-    
-    if len(kwargs) == 0:
-        return root
-    else:
-        obj = next(_find_all_descendants(root, kwargs), None)
-        if obj is None:
-            help_msg = _help_not_found(kwargs)
-            return NotFoundError(f"no widget from {_pprint(root)} with {kwargs} {help_msg}") 
-        else:
-            return obj
-
-    
-def find_all_objs(roots: Union[Atspi.Object, Iterable[Atspi.Object]], **kwargs: MatchArgs) -> list[Atspi.Object]:
-    """Searchs for all the at-spi objects that matches the arguments.
-
-    This function is similar to `find_obj`. The meaning of the
-    `kwargs` arguments is the same. But it presents the following
-    differences:
-
-    - Instead of a root object to start the search from, it's possible
-      to specify a collection of objects to start from every one of
-      them.
-
-    - Instead of returning the first object that matches the
-      arguments, it returns a list containing all of them.
-
-    Parameters
-    ----------
-    roots: Union[Atspi.Object, Iterable[Atspi.Object]]
-        The object/s to start the search from
-    **kwargs
-        See :py:data:`MatchArgs`
-
-    Returns
-    -------
-    list[Atspi.Object]
-        The list of all descendants that matches the arguments
-    """
-    
-    if isinstance(roots, Atspi.Object):
-        roots = [roots]
-    result = []
-    if len(kwargs) == 0:
-        for root in roots:
-            result.extend(obj for _path, obj in tree_walk(root))
-    else:
-        for root in roots:
-            result.extend(_find_all_descendants(root, kwargs))
-    return result
-
-
 def obj_children(obj: Atspi.Object) -> list[Atspi.Object]:
     """Obtains the list of children of an at-spi object.
 
@@ -437,182 +367,131 @@ def tree_walk(root: Atspi.Object, path: TreePath= ROOT_TREE_PATH) -> Iterator[tu
         yield from tree_walk(child, path= path + (NthOf(i,n_children),))
 
 
-# El nombre de la acción es un parámetro porque hay acciones con
-# espacios en el nombre. No intentamos que sea un atributo que
-# contiene un objeto callable, o cualquier opción que implique que el
-# nombre tiene que ser un _python name_.
-#
-# Usamos un Protocol porque no hay otra forma de definir el callable con
-# **kwargss :_(
-# https://mypy.readthedocs.io/en/stable/protocols.html#callback-protocols
-class UserDo(Protocol):
-    def __call__(name: str, **kwargs: MatchArgs) -> None: ...
-UIShows = Callable[..., bool]
-UIInteraction = tuple[UserDo, UIShows]
+def objects_in(root_s: Union[Atspi.Object, Iterable[Atspi.Object]],
+                  **kwargs: MatchArgs) -> Iterable[Atspi.Object]:
+    """Returns an iterable for all the objects that matches the given
+    conditions.
 
-class UserForeachDo(Protocol):
-    def __call__(name: str, **kwargs: MatchArgs) -> None: ...
-UIEachShows = Callable[..., Iterator[bool]]
-UIMultipleInteraction = tuple[UserForeachDo, UIEachShows]
-
-
-def _as_iterable(objs: Obj_S) -> Iterable[Atspi.Object]:
-    return (objs,) if isinstance(objs, Atspi.Object) else objs
-    
-               
-def _do(obj: Atspi.Object, action_name: str) -> None:
-    idx = _get_action_idx(obj, action_name)
-    if idx is None:
-        names = _get_actions_names(obj)
-        raise NotFoundError(f"widget {_pprint(obj)} has no action named '{name}', got: {','.join(names)}")
-    obj.do_action(idx)
-
-    
-def perform_on(root: Atspi.Object, **kwargs: MatchArgs) -> UIInteraction:
-    """Constructs functions that interact with one part of the user interface.
-
-    For the given at-spi object, this function finds the first
-    descendant that matches the patterns in `kwargs`. Then, it selects
-    the part of the UI given by the subtree which root is the found
-    object and constructs the following functions that performs
-    actions on that subtree:
-
-    .. function:: do(action_name : str, **kwargs: MatchArgs) -> None
-
-       Performs an action on the first descendant at-spi object that
-       matches the patterns.
-
-       :param str action_name: The name of the action
-       :param \*\*kwargs: See :py:data:`MatchArgs`
-       :raises NotFoundError: if no object mathces the patterns in kwargs
-       :raises NotFoundError: if the matching object doesn't provide the give action
-
-    .. function:: shows(**kwargs: MatchArgs) -> bool
-
-       Checks whether the UI shows the information given by the patterns.
-
-       Note that the pattern should specify both the information to be
-       shown and the at-spi object that contains that information.
-
-       :param \*\*kwargs: See :py:data:`MatchArgs`
-       :return: Whether any object matches the patterns
-       :rtype: bool
-
-    These functions interact, using at-spi, with the subtree rooted at
-    the at-spi object found. They implement two basic interactions,
-    intended to replace the users' interaction.
+    It searches below `root/s` the objects that matches the arguments
+    given in `kwargs`. As might be expected, below object means in the
+    subtree which root is this object.
 
     Parameters
     ----------
-    root : Atspi.Object
-        The at-spi object to start the search from
+    root_s: Union[Atspi.Object, Iterable[Atspi.Object]]
+        The root/s of the subtree/s where the search is performed.
 
     **kwargs
         See :py:data:`MatchArgs`
 
     Returns
     -------
-    UIInteraction
-        A tuple with the two functions: :py:func:`do` and :py:func:`shows`
-
-    Raises
-    ------
-    NotFoundError
-        If no object matches the patterns in `kwargs`
+    Iterable[Atspi.Object]
+        An iterable of the objects that matches the conditions.
 
     """
+
+    if isinstance(root_s, Atspi.Object):
+        root_s = [root_s]
+
+    result = []
+    if len(kwargs) == 0:
+        for root in root_s:
+            result.extend(obj for _path, obj in tree_walk(root))
+    else:
+        for root in root_s:
+            result.extend(_find_all_descendants(root, kwargs))
+    return result
         
-    on_obj = find_obj(root, **kwargs)
-    fail_on_error(on_obj)
+
+_MARK = object()
+
+
+class Action:
+    def __init__(self, action_name: str):
+        self.action_name = action_name
+
+    def on_all(self, objs: Iterable[Atspi.Object]) -> None:
+        for obj in objs:
+            self._do_action(obj)
+
+    def on_first(self, objs: Iterable[Atspi.Object]) -> None:
+        obj = next(objs)
+        self._do_action(obj)
+
+    def on(self, objs: Iterable[Atspi.Object]) -> None:
+        objs_iter = iter(objs)
+        obj = next(objs_iter)
+        if next(objs_iter, _MARK) is not _MARK:
+            raise AssertionError(f"when doing '{self.action_name}' on object"
+                                 f", found more than one object: {objs}")
+        self._do_action(obj)
+
+    def __str__(self) -> str:
+        return f"do('self.action_name')"
     
-    def do(action_name: str, **kwargs) -> None:
-        obj = find_obj(on_obj, **kwargs)
-        fail_on_error(obj)
-        _do(obj, action_name)
-        
-    def shows(**kwargs) -> bool:
-        if len(kwargs) == 0:
-            raise TypeError("shows must have at least one argument, got 0")
-        return not is_error(find_obj(on_obj, **kwargs))
-                   
-    return (do, shows)
+    def _do_action(self, obj: Atspi.Object) -> None:
+        idx = _get_action_idx(obj, self.action_name)
+        if idx is None:
+            names = _get_actions_names(obj)
+            raise NotFoundError(f"widget {_pprint(obj)} has no action named '{self.action_name}', got: {','.join(names)}")
+        obj.do_action(idx)
 
 
-def perform_on_each(roots: Iterable[Atspi.Object], **kwargs: MatchArgs) -> UIMultipleInteraction:
-    """Constructs functions that interact with some parts of the user interface.
+do = Action
 
-    This function is similar to :py:func:`perform_on`, but instead of
-    selecting one part (subtree) of the UI, it selects a collection of
-    them.
 
-    For each object in `roots`, it selects a subtree that starts at
-    the first descendant that matches the patterns in `kwargs`. Then
-    it constructs the following functions that performs actions on
-    that collections of subtrees:
+class Expectation:
+    def __init__(self, objects: Iterable[Atspi.Object], which_one: str):
+        self.objects = objects
+        self.which_one = which_one
 
-    .. function:: foreach_do(action_name : str, **kwargs: MatchArgs) -> None
+    def to_show(self, text: AnyStr) -> None:
+        predicate = lambda obj: obj_get_attr(obj, 'text') == text
+        if not self._check(predicate):
+            texts = [ f"  {_pprint(obj)} shows \"{obj_get_attr(obj, 'text')}\"" for obj in self.objects ]
+            raise AssertionError(f"expect {self.which_one} to show \"{text}\", but:\n" +
+                                 "\n".join(texts))
 
-       For each subtree performs an action on the first descendant
-       that matches the patterns.
+    def _check(self, predicate: Callable[[Atspi.Object],bool]) -> bool:
+        if self.which_one == 'all':
+            return all(predicate(obj) for obj in self.objects)
+        elif self.which_one == 'any':
+            return any(predicate(obj) for obj in self.objects)
+        elif self.which_one == 'first':
+            obj = next(self.objects, _MARK)
+            return obj is not _MARK and predicate(obj)
+        elif self.which_one == 'one':
+            checks = [ obj for obj in self.objects if predicate(obj) ]
+            return len(checks) == 1
+        else:
+            raise RuntimeError(f"unknown which_one= {self.which_one}")
 
-       :param str action_name: The name of the action
-       :param \*\*kwargs: See :py:data:`MatchArgs`
-       :raises NotFoundError: If no object matches the patterns in kwargs
-       :raises NotFountError: If the matching object doesn't provide the given action
+    def __str__(self) -> str:
+        # // TODO: Si Iterable[Atspi.Object] es un generador, aquí ya
+        # lo hemos agotado y no lo podemos volver a recorrer
+        objects_str = ",".join(_pprint(obj) for obj in self.objects)
+        return f"expect_{self.which_one}({objects_str})"
 
-    .. function:: each_shows(**kwargs: MatchArgs) -> Iterator[bool]
 
-       For each subtree checks wheter the UI shows the information
-       given by the patterns.
+def expect(objects: Iterable[Atspi.Object]) -> Expectation:
+    return Expectation(objects, 'all')
 
-       Note that the pattern should specify both the information to be
-       shown and the at-spi object that contains that information.
 
-       Note that the result is an iterator which data can be
-       aggregated using the builtins ``any`` or ``all``.
+def expect_all(objects: Iterable[Atspi.Object]) -> Expectation:
+    return Expectation(objects, 'all')
 
-       :param \*\*kwargs: See :py:data:`MatchArgs`
-       :return: A collection of booleans indicating whether any object matches the patterns for each root object
-       :rtype: Iterator[bool]
 
-    These functions will perform the interaction on every subtree. As
-    in :py:func:`perform_on`, they implement, using at-spi, two basic
-    interactions, intended to replace the users' interaction.
+def expect_any(objects: Iterable[Atspi.Object]) -> Expectation:
+    return Expectation(objects, 'any')
 
-    Parameters
-    ----------
-    roots : Union[Atspi.Object, Iterable[Atspi.Object]]
-        The object/s to start the search from
 
-    **kwargs
-        See :py:data:`MatchArgs`
+def expect_first(objects: Iterable[Atspi.Object]) -> Expectation:
+    return Expectation(objects, 'first')
 
-    Returns
-    -------
-    UIMultipleInteraction
-        A tuple with the two functions: :py:func:`foreach_do` and :py:func:`each_shows`
 
-    Raises
-    ------
-    NotFoundError
-        If no object matches the patterns in `kwargs`
-
-    """
-
-    on_objs = [ fail_on_error(find_obj(root, **kwargs))
-                for root in roots ]
-
-    def do(action_name: str, **kwargs) -> None:
-        for on_obj in on_objs:
-            _do(fail_on_error(find_obj(on_obj, **kwargs)),
-                action_name)
-
-    def shows(**kwargs) -> Iterator[bool]:
-        if len(kwargs) == 0:
-            raise TypeError("shows must have at least one argument, got 0")
-        return (not is_error(find_obj(on_obj, **kwargs)) for on_obj in on_objs)
-
-    return (do, shows)
+def expect_one(objects: Iterable[Atspi.Object]) -> Expectation:
+    return Expectation(objects, 'one')
 
 
 ###########################################################################
@@ -630,11 +509,24 @@ def _wait_for_app(name: str, timeout: Optional[float]= None) -> Optional[Atspi.O
     return app
 
 
-App = tuple[subprocess.Popen, Optional[Atspi.Object]]
+class SUT(NamedTuple):
+    process: subprocess.Popen
+    app: Optional[Atspi.Object]
+    path: Union[str, pathlib.Path]
+
+    def __enter__(self):
+        if self.app is None:
+            raise RuntimeError(f"the application {self.path} didn't show up in desktop")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.process:
+            self.process.kill()
+
 
 def run(path: Union[str, Path],
         name: Optional[str]= None,
-        timeout: Optional[float]= None) -> App:
+        timeout: Optional[float]= None) -> AbstractContextManager[SUT]:
     """Runs the command in a new os process. Waits for application to
     appear in desktop.
 
@@ -663,7 +555,8 @@ def run(path: Union[str, Path],
 
     Returns
     -------
-    (subprocess.Popen, Atspi.Object)
+    AbstractContextManager[SUT]
+       A named tuple that can be used as a context manager.
        Popen object that is in charge of running the command in a new process.
        The Atspi object that represents the application in the desktop, or None
        if it couldn't find the application after a given timeout.
@@ -676,7 +569,7 @@ def run(path: Union[str, Path],
     name = name or f"{path}-test-{str(random.randint(0, 100000000))}"
     process = subprocess.Popen([path, '--name', name])
     app = _wait_for_app(name, timeout)
-    return (process, app)
+    return SUT(process= process, app= app, path= path)
 
 
 def dump_desktop() -> None:
@@ -710,12 +603,17 @@ def dump_app(name: str) -> None:
     """
     
     desktop = Atspi.get_desktop(0)
-    apps = [app for app in obj_children(desktop) if app and app.get_name() == name]
-    if len(apps) == 0:
+    app = next(
+        (app for app in obj_children(desktop) if app and app.get_name() == name),
+        _MARK)
+    if app == _MARK:
         print(f"App {name} not found in desktop")
         print(f"Try running {__file__} without args to get the list of apps")
         sys.exit(0)
-    app = apps[0]
+    dump(app)
+
+
+def dump(app: Atspi.Object) -> None:    
     for path, node in tree_walk(app):
         interfaces = node.get_interfaces()
         try:
@@ -729,7 +627,7 @@ def dump_app(name: str) -> None:
         name = node.get_name() or ""
         draw_1 = "".join("  " if nth_of.is_last() else "│ " for nth_of in path[:-1])
         draw_2 = "└ " if path[-1].is_last() else "├ "
-        print(f"{draw_1}{draw_2}{role_name}({name}) {interfaces}")
+        print(f"{draw_1}{draw_2}{role_name}('{name}') {interfaces}")
 
 
 def main() -> None:
