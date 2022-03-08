@@ -167,7 +167,7 @@ def obj_get_attr(obj: Atspi.Object, name:str) -> Either[str]:
     if name == 'role':
         return obj.get_role_name()
     elif name == 'name':
-        return getattr(obj, 'name') or ""
+        return obj.get_name() or ""
     elif name == 'text':
         return obj.get_text(0, -1)
     elif hasattr(obj, name):
